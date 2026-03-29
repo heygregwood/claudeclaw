@@ -7,6 +7,8 @@ import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
+const MEMORY_DIR = join(process.cwd(), ".claude", "claudeclaw", "memory");
+const CORRECTIONS_FILE = join(process.cwd(), ".claude", "claudeclaw", "corrections.jsonl");
 // Resolve prompts relative to the claudeclaw installation, not the project dir
 const PROMPTS_DIR = join(import.meta.dir, "..", "prompts");
 const HEARTBEAT_PROMPT_FILE = join(PROMPTS_DIR, "heartbeat", "HEARTBEAT.md");
@@ -328,6 +330,136 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
+/**
+ * Build memory context for injection into the prompt.
+ * Scores memory entries by relevance to the current prompt.
+ * Includes corrections readback.
+ */
+async function buildMemoryContext(currentPrompt: string): Promise<string> {
+  const parts: string[] = [];
+  const now = new Date();
+  const todayStr = now.toISOString().slice(0, 10);
+  const yesterday = new Date(now.getTime() - 86400000);
+  const yesterdayStr = yesterday.toISOString().slice(0, 10);
+
+  // Load daily logs (today + yesterday always included)
+  for (const dateStr of [yesterdayStr, todayStr]) {
+    try {
+      const content = await Bun.file(join(MEMORY_DIR, `${dateStr}.md`)).text();
+      if (content.trim()) parts.push(content.trim());
+    } catch { /* doesn't exist yet */ }
+  }
+
+  // Load and score any other memory files (not date-based logs)
+  try {
+    const { readdir, stat } = await import("fs/promises");
+    const files = await readdir(MEMORY_DIR);
+    const promptLower = currentPrompt.toLowerCase();
+    const promptWords = promptLower.split(/\s+/).filter(w => w.length > 2);
+
+    const scored: Array<{ content: string; score: number }> = [];
+
+    for (const file of files) {
+      if (!file.endsWith(".md")) continue;
+      // Skip daily logs (already loaded above)
+      if (/^\d{4}-\d{2}-\d{2}\.md$/.test(file)) continue;
+
+      try {
+        const filePath = join(MEMORY_DIR, file);
+        const content = await Bun.file(filePath).text();
+        if (!content.trim()) continue;
+
+        const fileStat = await stat(filePath);
+        const ageDays = (now.getTime() - fileStat.mtimeMs) / (1000 * 60 * 60 * 24);
+        const contentLower = content.toLowerCase();
+
+        // Score by keyword overlap + recency
+        let score = 0;
+        for (const word of promptWords) {
+          if (contentLower.includes(word)) score += 2;
+        }
+        if (ageDays < 1) score += 3;
+        else if (ageDays < 7) score += 2;
+        else if (ageDays < 30) score += 1;
+
+        if (score > 0) scored.push({ content: content.trim(), score });
+      } catch { /* skip unreadable */ }
+    }
+
+    // Top 5 by relevance
+    scored.sort((a, b) => b.score - a.score);
+    for (const entry of scored.slice(0, 5)) {
+      parts.push(entry.content);
+    }
+  } catch { /* memory dir doesn't exist */ }
+
+  // Corrections readback -- last 10 factual updates
+  try {
+    const lines = (await Bun.file(CORRECTIONS_FILE).text()).trim().split("\n").filter(Boolean);
+    const last10 = lines.slice(-10).join("\n");
+    if (last10) parts.push("Recent corrections:\n" + last10);
+  } catch { /* no corrections file */ }
+
+  if (parts.length === 0) return "";
+  return "DAEMON MEMORY (context that survives compaction):\n" + parts.join("\n\n");
+}
+
+/**
+ * Auto-save a conversation summary to the daily memory log.
+ * Called by runner.ts after every non-trivial response -- no prompting needed.
+ */
+async function autoSaveMemory(name: string, prompt: string, output: string): Promise<void> {
+  const trimmed = output.trim();
+  if (!trimmed || trimmed === "HEARTBEAT_OK" || trimmed.startsWith("HEARTBEAT_OK")) return;
+
+  try {
+    await mkdir(MEMORY_DIR, { recursive: true });
+    const now = new Date();
+    const dateStr = now.toISOString().slice(0, 10);
+    const timeStr = now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+    const memFile = join(MEMORY_DIR, `${dateStr}.md`);
+
+    const shortPrompt = prompt.length > 200 ? prompt.slice(0, 200) + "..." : prompt;
+    const shortOutput = trimmed.length > 300 ? trimmed.slice(0, 300) + "..." : trimmed;
+
+    const entry = `\n### ${timeStr} - ${name.charAt(0).toUpperCase() + name.slice(1)}\n` +
+      `Prompt: ${shortPrompt}\n` +
+      `Response: ${shortOutput}\n`;
+
+    let existing = "";
+    try { existing = await Bun.file(memFile).text(); } catch { existing = `## ${dateStr}\n`; }
+    await Bun.write(memFile, existing + entry);
+  } catch (e) {
+    console.error(`[${new Date().toLocaleTimeString()}] Failed to write memory log:`, e);
+  }
+}
+
+/**
+ * Extract [remember: ...] tags from output, save each as a memory file.
+ * Returns the output with tags stripped.
+ */
+async function extractAndSaveRememberTags(output: string): Promise<string> {
+  const pattern = /\[remember:\s*(.+?)\]/g;
+  let match;
+  const memories: string[] = [];
+
+  while ((match = pattern.exec(output)) !== null) {
+    memories.push(match[1].trim());
+  }
+
+  if (memories.length === 0) return output;
+
+  await mkdir(MEMORY_DIR, { recursive: true });
+  for (const mem of memories) {
+    const key = "remember_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 4);
+    await Bun.write(join(MEMORY_DIR, `${key}.md`), mem);
+    console.log(`[${new Date().toLocaleTimeString()}] Saved memory: ${key}`);
+  }
+
+  // Strip tags from output before delivery
+  return output.replace(/\[remember:\s*.+?\]/g, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 async function execClaude(name: string, prompt: string): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -336,7 +468,8 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
 
-  const { security, model, api, fallback, agentic } = getSettings();
+  const settings = getSettings();
+  const { security, model, api, fallback, agentic } = settings;
 
   // Determine which model to use based on agentic routing
   let primaryConfig: ModelConfig;
@@ -388,43 +521,15 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   // natively on every -p invocation (confirmed via testing). Loading it
   // again via --append-system-prompt was duplicating ~300 lines per tick.
 
-  // Daily memory log -- survives compaction, loaded on every tick
-  const memoryDir = join(process.cwd(), ".claude", "claudeclaw", "memory");
-  const today = new Date();
-  const todayStr = today.toISOString().slice(0, 10);
-  const yesterday = new Date(today.getTime() - 86400000);
-  const yesterdayStr = yesterday.toISOString().slice(0, 10);
-  const todayLog = join(memoryDir, `${todayStr}.md`);
-  const yesterdayLog = join(memoryDir, `${yesterdayStr}.md`);
+  // --- Memory injection: load relevant context into the prompt ---
+  const memoryCtx = await buildMemoryContext(prompt);
+  if (memoryCtx) appendParts.push(memoryCtx);
 
-  const memoryParts: string[] = [];
-  for (const logFile of [yesterdayLog, todayLog]) {
-    try {
-      const content = await Bun.file(logFile).text();
-      if (content.trim()) memoryParts.push(content.trim());
-    } catch { /* file doesn't exist yet */ }
-  }
-
-  // Corrections readback -- last 10 factual updates
-  const correctionsFile = join(process.cwd(), ".claude", "claudeclaw", "corrections.jsonl");
-  try {
-    const lines = (await Bun.file(correctionsFile).text()).trim().split("\n").filter(Boolean);
-    const last10 = lines.slice(-10).join("\n");
-    if (last10) memoryParts.push("Recent corrections:\n" + last10);
-  } catch { /* no corrections file */ }
-
-  if (memoryParts.length > 0) {
-    appendParts.push(
-      "DAEMON MEMORY (read this to recover context after compaction):\n" +
-      memoryParts.join("\n\n")
-    );
-  }
-
+  // Tell the model it can use [remember: ...] tags to save important info
   appendParts.push(
-    "DAEMON MEMORY LOG (MANDATORY): After ANY non-trivial work (Telegram conversation, non-HEARTBEAT_OK heartbeat, cron job, data update), " +
-    "you MUST silently append a 2-3 line summary to .claude/claudeclaw/memory/" + todayStr + ".md. " +
-    "Format: ### HH:MM - [Heartbeat|Telegram|Cron: job-name] followed by what happened. Create the file if needed. Skip only for routine HEARTBEAT_OK ticks. " +
-    "IMPORTANT: The memory log is a silent background action. Your output to Greg must be the actual answer to his question or the heartbeat result. NEVER say 'Memory logged' or mention the log to Greg."
+    "If you learn something important that should persist across sessions, " +
+    "include [remember: <fact>] anywhere in your output. It will be saved automatically and stripped before delivery. " +
+    "Use sparingly -- only for durable facts, preferences, or decisions, not routine information."
   );
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
@@ -495,6 +600,19 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
 
   await Bun.write(logFile, output);
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
+
+  // --- Auto-save memory + extract [remember:] tags ---
+  if (exitCode === 0 && !rateLimitMessage) {
+    // Auto-save conversation summary to daily log
+    await autoSaveMemory(name, prompt, stdout);
+
+    // Extract and save [remember: ...] tags, strip from output
+    const cleaned = await extractAndSaveRememberTags(stdout);
+    if (cleaned !== stdout) {
+      stdout = cleaned;
+      result.stdout = cleaned;
+    }
+  }
 
   // --- Auto-compact on timeout (exit 124) ---
   if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing) {
