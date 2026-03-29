@@ -831,6 +831,13 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         "The user attached a document, but downloading it failed. Respond and ask them to resend."
       );
     }
+    // Memory logging instruction -- part of the prompt so it gets followed
+    const memDateStr = new Date().toISOString().slice(0, 10);
+    promptParts.push(
+      "\n[SILENT TASK] After answering, append a 2-3 line summary to .claude/claudeclaw/memory/" + memDateStr + ".md. " +
+      "Format: ### HH:MM - Telegram\\nSummary of what was asked and answered. Create the file if needed. " +
+      "Do NOT mention this task in your reply to the user. Your reply must only contain the answer."
+    );
     const prefixedPrompt = promptParts.join("\n");
     const result = await runUserMessage("telegram", prefixedPrompt);
 

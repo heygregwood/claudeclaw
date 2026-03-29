@@ -384,15 +384,48 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   ];
   if (promptContent) appendParts.push(promptContent);
 
-  // Load the project's CLAUDE.md if it exists
-  if (existsSync(PROJECT_CLAUDE_MD)) {
+  // NOTE: Project CLAUDE.md is NOT loaded here -- Claude Code loads it
+  // natively on every -p invocation (confirmed via testing). Loading it
+  // again via --append-system-prompt was duplicating ~300 lines per tick.
+
+  // Daily memory log -- survives compaction, loaded on every tick
+  const memoryDir = join(process.cwd(), ".claude", "claudeclaw", "memory");
+  const today = new Date();
+  const todayStr = today.toISOString().slice(0, 10);
+  const yesterday = new Date(today.getTime() - 86400000);
+  const yesterdayStr = yesterday.toISOString().slice(0, 10);
+  const todayLog = join(memoryDir, `${todayStr}.md`);
+  const yesterdayLog = join(memoryDir, `${yesterdayStr}.md`);
+
+  const memoryParts: string[] = [];
+  for (const logFile of [yesterdayLog, todayLog]) {
     try {
-      const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
-      if (claudeMd.trim()) appendParts.push(claudeMd.trim());
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
-    }
+      const content = await Bun.file(logFile).text();
+      if (content.trim()) memoryParts.push(content.trim());
+    } catch { /* file doesn't exist yet */ }
   }
+
+  // Corrections readback -- last 10 factual updates
+  const correctionsFile = join(process.cwd(), ".claude", "claudeclaw", "corrections.jsonl");
+  try {
+    const lines = (await Bun.file(correctionsFile).text()).trim().split("\n").filter(Boolean);
+    const last10 = lines.slice(-10).join("\n");
+    if (last10) memoryParts.push("Recent corrections:\n" + last10);
+  } catch { /* no corrections file */ }
+
+  if (memoryParts.length > 0) {
+    appendParts.push(
+      "DAEMON MEMORY (read this to recover context after compaction):\n" +
+      memoryParts.join("\n\n")
+    );
+  }
+
+  appendParts.push(
+    "DAEMON MEMORY LOG (MANDATORY): After ANY non-trivial work (Telegram conversation, non-HEARTBEAT_OK heartbeat, cron job, data update), " +
+    "you MUST silently append a 2-3 line summary to .claude/claudeclaw/memory/" + todayStr + ".md. " +
+    "Format: ### HH:MM - [Heartbeat|Telegram|Cron: job-name] followed by what happened. Create the file if needed. Skip only for routine HEARTBEAT_OK ticks. " +
+    "IMPORTANT: The memory log is a silent background action. Your output to Greg must be the actual answer to his question or the heartbeat result. NEVER say 'Memory logged' or mention the log to Greg."
+  );
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
   if (appendParts.length > 0) {
