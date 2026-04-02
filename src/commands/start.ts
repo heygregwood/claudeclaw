@@ -693,17 +693,43 @@ export async function start(args: string[] = []) {
 
   updateState();
 
+  function runChainedJobs(completedJobName: string) {
+    const chained = currentJobs.filter((j) => j.runAfter === completedJobName);
+    for (const chainedJob of chained) {
+      console.log(`[${ts()}] Chaining: ${chainedJob.name} (after ${completedJobName})`);
+      resolvePrompt(chainedJob.prompt)
+        .then((prompt) => run(chainedJob.name, prompt))
+        .then((r) => {
+          if (chainedJob.notify === false) return;
+          if (chainedJob.notify === "error" && r.exitCode === 0) return;
+          forwardToTelegram(chainedJob.name, r);
+          forwardToDiscord(chainedJob.name, r);
+        })
+        .then(() => {
+          runChainedJobs(chainedJob.name);
+        });
+    }
+  }
+
   setInterval(() => {
     const now = new Date();
     for (const job of currentJobs) {
+      if (!job.schedule) continue;  // runAfter-only jobs, skip cron matching
       if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
         resolvePrompt(job.prompt)
           .then((prompt) => run(job.name, prompt))
           .then((r) => {
-            if (job.notify === false) return;
-            if (job.notify === "error" && r.exitCode === 0) return;
+            if (job.notify === false) {
+              runChainedJobs(job.name);
+              return;
+            }
+            if (job.notify === "error" && r.exitCode === 0) {
+              runChainedJobs(job.name);
+              return;
+            }
             forwardToTelegram(job.name, r);
             forwardToDiscord(job.name, r);
+            runChainedJobs(job.name);
           })
           .finally(async () => {
             if (job.recurring) return;
