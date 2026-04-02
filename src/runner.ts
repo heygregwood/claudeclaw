@@ -460,6 +460,36 @@ async function extractAndSaveRememberTags(output: string): Promise<string> {
   return output.replace(/\[remember:\s*.+?\]/g, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/**
+ * Strip internal notes that should never reach the user.
+ * Belt-and-suspenders: the prompt tells Claude not to output these,
+ * but if it slips through, catch it here before delivery.
+ */
+function stripInternalNotes(output: string): string {
+  const patterns = [
+    // "Memory log for this exchange: ..." (full line)
+    /^Memory log[^\n]*$/gm,
+    // "Response sent and logged to daily memory" style
+    /^Response sent[^\n]*$/gm,
+    // "Let me update the memory file" / "Let me log this"
+    /^Let me (?:update|log|write|save|append)[^\n]*(?:memory|log|file|daily)[^\n]*$/gim,
+    // "The daily memory already has..." / "Memory log already captured..."
+    /^(?:The daily memory|Memory log) already[^\n]*$/gm,
+    // "I've logged this..." / "Logged to daily memory"
+    /^(?:I've logged|Logged to)[^\n]*$/gm,
+    // "HEARTBEAT_OK" fragments mixed with real content
+    /^HEARTBEAT_OK\s*$/gm,
+  ];
+
+  let cleaned = output;
+  for (const pat of patterns) {
+    cleaned = cleaned.replace(pat, "");
+  }
+  // Collapse multiple blank lines left behind
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
+  return cleaned;
+}
+
 async function execClaude(name: string, prompt: string): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -611,6 +641,13 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
     if (cleaned !== stdout) {
       stdout = cleaned;
       result.stdout = cleaned;
+    }
+
+    // Strip internal notes that should never reach Telegram
+    const stripped = stripInternalNotes(stdout);
+    if (stripped !== stdout) {
+      stdout = stripped;
+      result.stdout = stripped;
     }
   }
 
